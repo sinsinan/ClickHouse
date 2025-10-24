@@ -56,6 +56,7 @@
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/re2.h>
+#include "Interpreters/StorageID.h"
 #include <Formats/SchemaInferenceUtils.h>
 #include <base/defines.h>
 
@@ -382,7 +383,7 @@ std::unique_ptr<ReadBuffer> createReadBuffer(
 
 }
 
-Strings StorageFile::getPathsList(const String & table_path, const String & user_files_path, const ContextPtr & context, size_t & total_bytes_to_read)
+Strings StorageFile::getPathsList(const String & table_path, const std::vector<String> & user_files_paths, const ContextPtr & context, size_t & total_bytes_to_read)
 {
     fs::path user_files_absolute_path = fs::weakly_canonical(user_files_path);
     fs::path fs_table_path(table_path);
@@ -893,7 +894,7 @@ namespace
             return std::nullopt;
         }
 
-        const StorageFile::ArchiveInfo & archive_info;
+        const std::vector<StorageFile::ArchiveInfo> & archive_infos;
 
         size_t current_archive_index = 0;
 
@@ -950,8 +951,13 @@ std::pair<ColumnsDescription, String> StorageFile::getTableStructureAndFormatFro
     const String & compression_method,
     const std::optional<FormatSettings> & format_settings,
     const ContextPtr & context,
-    const std::optional<ArchiveInfo> & archive_info)
+    const std::vector<ArchiveInfo> & archive_infos)
 {
+    if (archive_infos.size() != paths.size())
+    {
+        // TODO: add valid errorcode here
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "archive_infos size ({}) and path size should be the same({})", archive_infos.size(), paths.size());
+    }
     if (format == "Distributed")
     {
         if (paths.empty())
@@ -960,7 +966,8 @@ std::pair<ColumnsDescription, String> StorageFile::getTableStructureAndFormatFro
         return {ColumnsDescription(DistributedAsyncInsertSource(paths[0]).getOutputs().front().getHeader().getNamesAndTypesList()), *format};
     }
 
-    if (((archive_info && archive_info->paths_to_archives.empty()) || (!archive_info && paths.empty()))
+
+    if (paths.empty()
         && (!format || !FormatFactory::instance().checkIfFormatHasExternalSchemaReader(*format)))
     {
         if (format)
@@ -976,21 +983,14 @@ std::pair<ColumnsDescription, String> StorageFile::getTableStructureAndFormatFro
 
     }
 
-    if (archive_info)
-    {
-        ReadBufferFromArchiveIterator read_buffer_iterator(*archive_info, format, format_settings, context);
-        if (format)
-            return {readSchemaFromFormat(*format, format_settings, read_buffer_iterator, context), *format};
 
-        return detectFormatAndReadSchema(format_settings, read_buffer_iterator, context);
-    }
-
-    ReadBufferFromFileIterator read_buffer_iterator(paths, format, compression_method, format_settings, context);
+    ReadBufferFromArchiveIterator read_buffer_iterator(*archive_infos, format, format_settings, context);
     if (format)
         return {readSchemaFromFormat(*format, format_settings, read_buffer_iterator, context), *format};
 
     return detectFormatAndReadSchema(format_settings, read_buffer_iterator, context);
 }
+
 
 ColumnsDescription StorageFile::getTableStructureFromFile(
     const DB::String & format,
@@ -1000,7 +1000,7 @@ ColumnsDescription StorageFile::getTableStructureFromFile(
     const ContextPtr & context,
     const std::optional<ArchiveInfo> & archive_info)
 {
-    return getTableStructureAndFormatFromFileImpl(format, paths, compression_method, format_settings, context, archive_info).first;
+    return getTableStructureAndFormatFromFileImpl(format, paths, compression_method, format_settings, context, TODO).first;
 }
 
 std::pair<ColumnsDescription, String> StorageFile::getTableStructureAndFormatFromFile(
@@ -1010,7 +1010,7 @@ std::pair<ColumnsDescription, String> StorageFile::getTableStructureAndFormatFro
     const ContextPtr & context,
     const std::optional<ArchiveInfo> & archive_info)
 {
-    return getTableStructureAndFormatFromFileImpl(std::nullopt, paths, compression_method, format_settings, context, archive_info);
+    return getTableStructureAndFormatFromFileImpl(std::nullopt, paths, compression_method, format_settings, context, TODO);
 }
 
 bool StorageFile::supportsSubsetOfColumns(const ContextPtr & context) const
@@ -1069,11 +1069,11 @@ StorageFile::StorageFile(int table_fd_, CommonArguments args)
     setStorageMetadata(args);
 }
 
-StorageFile::StorageFile(const std::string & table_path_, const std::string & user_files_path, CommonArguments args)
+StorageFile::StorageFile(const std::string & table_path_, const std::vector<String> & user_files_paths, CommonArguments args)
     : StorageFile(args)
 {
-    if (!args.path_to_archive.empty())
-        archive_info = getArchiveInfo(args.path_to_archive, table_path_, user_files_path, args.getContext(), total_bytes_to_read);
+    if (!args.paths_to_archives.empty())
+        archive_infos = getArchiveInfos(args.paths_to_archives, table_path_, user_files_paths, args.getContext(), total_bytes_to_read);
     else
         paths = getPathsList(table_path_, user_files_path, args.getContext(), total_bytes_to_read);
 
@@ -1089,7 +1089,7 @@ StorageFile::StorageFile(const std::string & table_path_, const std::string & us
     setStorageMetadata(args);
 }
 
-StorageFile::StorageFile(const std::string & table_path_, const std::string & user_files_path, bool distributed_processing_, CommonArguments args)
+StorageFile::StorageFile(const std::string & table_path_, const std::vector<std::string> & user_files_paths, bool distributed_processing_, CommonArguments args)
     : StorageFile(table_path_, user_files_path, args)
 {
     distributed_processing = distributed_processing_;
@@ -1201,13 +1201,13 @@ using StorageFilePtr = std::shared_ptr<StorageFile>;
 
 StorageFileSource::FilesIterator::FilesIterator(
     const Strings & files_,
-    std::optional<StorageFile::ArchiveInfo> archive_info_,
+    const std::vector<StorageFile::ArchiveInfo> & archive_infos_,
     const ActionsDAG::Node * predicate,
     const NamesAndTypesList & virtual_columns,
     const NamesAndTypesList & hive_columns,
     const ContextPtr & context_,
     bool distributed_processing_)
-    : WithContext(context_), files(files_), archive_info(std::move(archive_info_)), distributed_processing(distributed_processing_)
+    : WithContext(context_), files(files_), archive_infos(std::move(archive_infos_)), distributed_processing(distributed_processing_)
 {
     std::optional<ActionsDAG> filter_dag;
     if (!distributed_processing && !archive_info && !files.empty())
@@ -1745,7 +1745,7 @@ void ReadFromFile::createIterator(const ActionsDAG::Node * predicate)
 
     files_iterator = std::make_shared<StorageFileSource::FilesIterator>(
         storage->paths,
-        storage->archive_info,
+        storage->archive_infos,
         predicate,
         storage->getVirtualsList(),
         info.hive_partition_columns_to_read_from_file_path,
@@ -2339,6 +2339,19 @@ SchemaCache & StorageFile::getSchemaCache(const ContextPtr & context)
     return schema_cache;
 }
 
+void StorageFile::parseFileSources(Strings sources, Strings & filenames, Strings & path_to_archives, bool allow_archive_path_syntax)
+{
+    for (auto & source : sources)
+    {
+        String path_to_archive;
+        String single_filename_parsed;
+        parseFileSource(std::move(source), single_filename_parsed, path_to_archive, allow_archive_path_syntax);
+        filenames.push_back(single_filename_parsed);
+        path_to_archives.push_back(path_to_archive);
+    }
+}
+
+
 void StorageFile::parseFileSource(String source, String & filename, String & path_to_archive, bool allow_archive_path_syntax)
 {
     if (!allow_archive_path_syntax)
@@ -2374,6 +2387,38 @@ void StorageFile::parseFileSource(String source, String & filename, String & pat
 
     path_to_archive = path_to_archive_view;
     filename = filename_view;
+}
+
+std::vector<StorageFile::FileArchiveInfo> StorageFile::getArchiveInfos(
+    const Strings & paths_to_archive,
+    const Strings & files_in_archive,
+    const std::string & user_files_path,
+    const ContextPtr & context,
+    size_t & total_bytes_to_read)
+{
+    if (paths_to_archive.size() != files_in_archive.size())
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Mismatch between number of archive paths ({}) and files in archive ({})",
+            paths_to_archive.size(),
+            files_in_archive.size()
+        );
+
+    std::vector<StorageFile::FileArchiveInfo> file_archive_infos;
+    file_archive_infos.reserve(paths_to_archive.size());
+
+    for (size_t i = 0; i < paths_to_archive.size(); ++i)
+    {
+        const auto & path = paths_to_archive[i];
+        const auto & file_in_archive = files_in_archive[i];
+        FileArchiveInfo file_archive_info;
+        file_archive_info.filename = file_in_archive;
+        file_archive_info.archive_info = getArchiveInfo(path, file_in_archive, user_files_path, context, total_bytes_to_read);
+
+        file_archive_infos.push_back(file_archive_info);
+    }
+
+    return file_archive_infos;
 }
 
 StorageFile::ArchiveInfo StorageFile::getArchiveInfo(

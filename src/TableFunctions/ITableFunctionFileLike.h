@@ -2,6 +2,7 @@
 
 #include <TableFunctions/ITableFunction.h>
 #include <Core/Names.h>
+#include <Core/Types.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/IAST_fwd.h>
 
@@ -26,10 +27,10 @@ class ITableFunctionFileLike : public ITableFunction
 {
 public:
     static constexpr auto max_number_of_arguments = 4;
-    static constexpr auto signature = " - filename\n"
-                                      " - filename, format\n"
-                                      " - filename, format, structure\n"
-                                      " - filename, format, structure, compression_method\n";
+    static constexpr auto signature = " - filename or [filename, ...]\n"
+                                      " - filename or [filename, ...], format\n"
+                                      " - filename or [filename, ...], format, structure\n"
+                                      " - filename or [filename, ...], format, structure, compression_method\n";
     virtual String getSignature() const
     {
         return signature;
@@ -56,14 +57,14 @@ public:
         for (auto & arg : args)
             arg = evaluateConstantExpressionOrIdentifierAsLiteral(arg, context);
 
-        /// f(filename)
+        /// f([filename, ...])
         if (args.size() == 1)
         {
             args.push_back(format_literal);
             if (with_structure)
                 args.push_back(structure_literal);
         }
-        /// f(filename, format)
+        /// f([filename, ...], format)
         else if (args.size() == 2)
         {
             if (checkAndGetLiteralArgument<String>(args[1], "format") == "auto")
@@ -71,7 +72,7 @@ public:
             if (with_structure)
                 args.push_back(structure_literal);
         }
-        /// f(filename, format, structure) or f(filename, format, structure, compression) or f(filename, format, compression)
+        /// f([filename, ...], format, structure) or f([filename, ...], format, structure, compression) or f([filename, ...], format, compression)
         else if (args.size() >= 3)
         {
             if (checkAndGetLiteralArgument<String>(args[1], "format") == "auto")
@@ -89,7 +90,7 @@ protected:
     virtual void parseFirstArguments(const ASTPtr & arg, const ContextPtr & context);
     virtual std::optional<String> tryGetFormatFromFirstArgument();
 
-    String filename;
+    Strings filenames;
     String format = "auto";
     String structure = "auto";
     String compression_method = "auto";
@@ -99,7 +100,7 @@ private:
     StoragePtr executeImpl(const ASTPtr & ast_function, ContextPtr context, const std::string & table_name, ColumnsDescription cached_columns, bool is_insert_query) const override;
 
     virtual StoragePtr getStorage(
-        const String & source, const String & format, const ColumnsDescription & columns, ContextPtr global_context,
+        const Strings & sources, const String & format, const ColumnsDescription & columns, ContextPtr global_context,
         const std::string & table_name, const String & compression_method, bool is_insert_query) const = 0;
 
     bool hasStaticStructure() const override { return structure != "auto"; }

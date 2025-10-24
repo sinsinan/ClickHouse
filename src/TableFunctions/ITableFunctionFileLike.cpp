@@ -1,11 +1,16 @@
+#include <Interpreters/Context.h>
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/parseColumnsListForTableFunction.h>
+#include <Parsers/ASTLiteral.h>
 
 #include <Storages/StorageFile.h>
+#include <Storages/StorageSet.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/checkAndGetLiteralArgument.h>
 
 #include <Common/Exception.h>
+#include "Parsers/IAST_fwd.h"
+#include "base/types.h"
 #include <Formats/FormatFactory.h>
 #include <Parsers/ASTFunction.h>
 #include <TableFunctions/ITableFunctionFileLike.h>
@@ -22,12 +27,42 @@ namespace ErrorCodes
 
 void ITableFunctionFileLike::parseFirstArguments(const ASTPtr & arg, const ContextPtr &)
 {
-    filename = checkAndGetLiteralArgument<String>(arg, "source");
+    const auto * literal = arg->as<ASTLiteral>();
+    // bool is_tuple = (literal && literal->value.getType() == Field::Types::Tuple);
+    bool is_array = (literal && literal->value.getType() == Field::Types::Array);
+
+    if (is_array) {
+        auto file_paths = checkAndGetLiteralArgument<Array>(arg, "source");
+        for (const auto & file_path : file_paths)
+            filenames.push_back(file_path.safeGet<String>());
+    }
+    // else if (is_tuple) {
+    //     for (const auto & file_path : literal->value.safeGet<const Array &>())
+    //         filenames.push_back(checkAndGetLiteralArgument<String>(evaluateConstantExpressionOrIdentifierAsLiteral(file_path, context), "source"));
+    // }
+    else if (literal && literal->value.getType() == Field::Types::String) {
+        filenames.push_back(checkAndGetLiteralArgument<String>(arg, "source"));
+    }
+    else {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid argument for table function '{}'", getName());
+    }
 }
 
 std::optional<String> ITableFunctionFileLike::tryGetFormatFromFirstArgument()
 {
-    return FormatFactory::instance().tryGetFormatFromFileName(filename);
+    std::optional<String> prev_format;
+    for (const auto & filename : filenames)
+    {
+        if (auto fmt = FormatFactory::instance().tryGetFormatFromFileName(filename))
+        {
+            if (prev_format && *prev_format != *fmt)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "Cannot deduce format from file names, got different formats: '{}' and '{}'",
+                                *prev_format, *fmt);
+            prev_format = fmt;
+        }
+    }
+    return prev_format;
 }
 
 bool ITableFunctionFileLike::supportsReadingSubsetOfColumns(const ContextPtr & context)
@@ -93,7 +128,7 @@ StoragePtr ITableFunctionFileLike::executeImpl(const ASTPtr & /*ast_function*/, 
     else if (!structure_hint.empty())
         columns = structure_hint;
 
-    StoragePtr storage = getStorage(filename, format, columns, context, table_name, compression_method, is_insert_query);
+    StoragePtr storage = getStorage(filenames, format, columns, context, table_name, compression_method, is_insert_query);
     storage->startup();
     return storage;
 }

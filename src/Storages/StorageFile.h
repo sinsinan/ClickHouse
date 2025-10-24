@@ -29,6 +29,24 @@ class PullingPipelineExecutor;
 class StorageFile final : public IStorage
 {
 public:
+    struct ArchiveInfo
+    {
+        std::vector<std::string> paths_to_archives;
+        std::string path_in_archive; // used when reading a single file from archive
+        IArchiveReader::NameFilter filter; // used when files inside archive are defined with a glob
+
+        bool isSingleFileRead() const
+        {
+            return !filter;
+        }
+    };
+
+    struct FileArchiveInfo
+    {
+        std::string filename;
+        ArchiveInfo archive_info;
+    };
+
     struct CommonArguments : public WithContext
     {
         StorageID table_id;
@@ -39,16 +57,16 @@ public:
         const ConstraintsDescription & constraints;
         const String & comment;
         const std::string rename_after_processing;
-        std::string path_to_archive;
+        const std::vector<std::string> paths_to_archives;
     };
 
     /// From file descriptor
     StorageFile(int table_fd_, CommonArguments args);
 
-    /// From user's file
-    StorageFile(const std::string & table_path_, const std::string & user_files_path, CommonArguments args);
+    /// From user's files
+    StorageFile(const std::string & table_path_, const std::vector<std::string> & user_files_paths, CommonArguments args);
 
-    StorageFile(const std::string & table_path_, const std::string & user_files_path, bool distributed_processing_, CommonArguments args);
+    StorageFile(const std::string & table_path_, const std::vector<std::string> & user_files_paths, bool distributed_processing_, CommonArguments args);
 
     /// From table in database
     StorageFile(const std::string & relative_table_dir_path, CommonArguments args);
@@ -109,18 +127,6 @@ public:
 
     bool supportsPartitionBy() const override { return true; }
 
-    struct ArchiveInfo
-    {
-        std::vector<std::string> paths_to_archives;
-        std::string path_in_archive; // used when reading a single file from archive
-        IArchiveReader::NameFilter filter; // used when files inside archive are defined with a glob
-
-        bool isSingleFileRead() const
-        {
-            return !filter;
-        }
-    };
-
     static ColumnsDescription getTableStructureFromFile(
         const String & format,
         const std::vector<String> & paths,
@@ -138,11 +144,20 @@ public:
 
     static SchemaCache & getSchemaCache(const ContextPtr & context);
 
+    static void parseFileSources(Strings sources, Strings & filenames, Strings & path_to_archives, bool allow_archive_path_syntax);
+
     static void parseFileSource(String source, String & filename, String & path_to_archive, bool allow_archive_path_syntax);
 
     static ArchiveInfo getArchiveInfo(
         const std::string & path_to_archive,
         const std::string & file_in_archive,
+        const std::string & user_files_path,
+        const ContextPtr & context,
+        size_t & total_bytes_to_read);
+
+    static std::vector<StorageFile::FileArchiveInfo> getArchiveInfos(
+        const std::vector<std::string> & path_to_archives,
+        const std::vector<std::string> & file_in_archives,
         const std::string & user_files_path,
         const ContextPtr & context,
         size_t & total_bytes_to_read);
@@ -165,7 +180,7 @@ private:
         const String & compression_method,
         const std::optional<FormatSettings> & format_settings,
         const ContextPtr & context,
-        const std::optional<ArchiveInfo> & archive_info = std::nullopt);
+        const std::vector<ArchiveInfo> & archive_infos);
 
     void setStorageMetadata(CommonArguments args);
 
@@ -182,7 +197,7 @@ private:
     std::string base_path;
     std::vector<std::string> paths;
 
-    std::optional<ArchiveInfo> archive_info;
+    std::vector<ArchiveInfo> archive_infos;
 
     bool is_db_table = true;        /// Table is stored in real database, not user's file
     bool use_table_fd = false;      /// Use table_fd instead of path
@@ -223,7 +238,7 @@ public:
     public:
         explicit FilesIterator(
             const Strings & files_,
-            std::optional<StorageFile::ArchiveInfo> archive_info_,
+            const std::vector<StorageFile::ArchiveInfo> & archive_info_,
             const ActionsDAG::Node * predicate,
             const NamesAndTypesList & virtual_columns,
             const NamesAndTypesList & hive_columns,
@@ -234,7 +249,7 @@ public:
 
         bool isReadFromArchive() const
         {
-            return archive_info.has_value();
+            return archive_info_.has_value();
         }
 
         bool validFileInArchive(const std::string & path) const
@@ -251,7 +266,7 @@ public:
 private:
         std::vector<std::string> files;
 
-        std::optional<StorageFile::ArchiveInfo> archive_info;
+        std::vector<StorageFile::ArchiveInfo> archive_infos;
 
         std::atomic<size_t> index = 0;
 

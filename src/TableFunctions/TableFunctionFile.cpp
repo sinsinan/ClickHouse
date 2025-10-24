@@ -12,6 +12,9 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Formats/FormatFactory.h>
 #include <Storages/HivePartitioningUtils.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTLiteral.h>
+#include "base/types.h"
 
 
 namespace DB
@@ -25,6 +28,7 @@ namespace Setting
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 
 void TableFunctionFile::parseFirstArguments(const ASTPtr & arg, const ContextPtr & context)
@@ -32,24 +36,27 @@ void TableFunctionFile::parseFirstArguments(const ASTPtr & arg, const ContextPtr
     if (context->getApplicationType() != Context::ApplicationType::LOCAL)
     {
         ITableFunctionFileLike::parseFirstArguments(arg, context);
-        StorageFile::parseFileSource(std::move(filename), filename, path_to_archive, context->getSettingsRef()[Setting::allow_archive_path_syntax]);
+        StorageFile::parseFileSources(std::move(filenames), filenames, path_to_archives, context->getSettingsRef()[Setting::allow_archive_path_syntax]);
         return;
     }
 
     const auto * literal = arg->as<ASTLiteral>();
+    if (!literal)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "First argument must be a literal");
+
     auto type = literal->value.getType();
     if (type == Field::Types::String)
     {
-        filename = literal->value.safeGet<String>();
-        if (filename == "stdin" || filename == "-")
-            fd = STDIN_FILENO;
-        else if (filename == "stdout")
-            fd = STDOUT_FILENO;
-        else if (filename == "stderr")
-            fd = STDERR_FILENO;
-        else
-            StorageFile::parseFileSource(
-                std::move(filename), filename, path_to_archive, context->getSettingsRef()[Setting::allow_archive_path_syntax]);
+        String path = literal->value.safeGet<String>();
+        if (path == "stdin" || path == "-") { fd = STDIN_FILENO; return; }
+        if (path == "stdout") { fd = STDOUT_FILENO; return; }
+        if (path == "stderr") { fd = STDERR_FILENO; return; }
+
+        String single_filename_parsed;
+        String path_to_archive;
+        StorageFile::parseFileSource(std::move(path), single_filename_parsed, path_to_archive, context->getSettingsRef()[Setting::allow_archive_path_syntax]);
+        filenames.push_back(single_filename_parsed);
+        path_to_archives.push_back(path_to_archive);
     }
     else if (type == Field::Types::Int64 || type == Field::Types::UInt64)
     {
@@ -59,18 +66,20 @@ void TableFunctionFile::parseFirstArguments(const ASTPtr & arg, const ContextPtr
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "File descriptor must be non-negative");
     }
     else
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The first argument of table function '{}' mush be path or file descriptor", getName());
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The first argument of table function '{}' must be a path or a file descriptor", getName());
 }
 
 std::optional<String> TableFunctionFile::tryGetFormatFromFirstArgument()
 {
     if (fd >= 0)
         return FormatFactory::instance().tryGetFormatFromFileDescriptor(fd);
-    return FormatFactory::instance().tryGetFormatFromFileName(filename);
+    if (!filenames.empty())
+        return FormatFactory::instance().tryGetFormatFromFileName(filenames.front());
+    return {};
 }
 
 StoragePtr TableFunctionFile::getStorage(
-    const String & source,
+    const Strings & sources,
     const String & format_,
     const ColumnsDescription & columns,
     ContextPtr global_context,
@@ -90,13 +99,12 @@ StoragePtr TableFunctionFile::getStorage(
         ConstraintsDescription{},
         String{},
         global_context->getSettingsRef()[Setting::rename_files_after_processing],
-        path_to_archive,
     };
 
     if (fd >= 0)
         return std::make_shared<StorageFile>(fd, args);
 
-    return std::make_shared<StorageFile>(source, global_context->getUserFilesPath(), false, args);
+    return std::make_shared<StorageFile>(sources, global_context->getUserFilesPath(), false, args);
 }
 
 ColumnsDescription TableFunctionFile::getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const
@@ -105,15 +113,30 @@ ColumnsDescription TableFunctionFile::getActualTableStructure(ContextPtr context
     {
         if (fd >= 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Schema inference is not supported for table function '{}' with file descriptor", getName());
+
+        if (filenames.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot infer structure without a file path for table function '{}'", getName());
+
         size_t total_bytes_to_read = 0;
 
         Strings paths;
-        std::optional<StorageFile::ArchiveInfo> archive_info;
-        if (path_to_archive.empty())
-            paths = StorageFile::getPathsList(filename, context->getUserFilesPath(), context, total_bytes_to_read);
+        std::optional<std::vector<StorageFile::FileArchiveInfo>> archive_info;
+        if (path_to_archives.empty())
+        {
+            for (const auto & file : filenames)
+            {
+                auto new_paths = StorageFile::getPathsList(file, context->getUserFilesPath(), context, total_bytes_to_read);
+                paths.insert(paths.end(), new_paths.begin(), new_paths.end());
+            }
+        }
         else
+        {
+            if (filenames.size() > 1)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Archive path is set, but multiple files are provided");
             archive_info
-                = StorageFile::getArchiveInfo(path_to_archive, filename, context->getUserFilesPath(), context, total_bytes_to_read);
+                = StorageFile::getArchiveInfos(path_to_archives, filenames, context->getUserFilesPath(), context, total_bytes_to_read);
+        }
+
 
         ColumnsDescription columns;
         if (format == "auto")
